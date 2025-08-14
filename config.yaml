@@ -1,0 +1,16 @@
+debate:
+  cache_size: 10000
+  enable_cache: true
+  enable_prune: true
+  enable_reflect: true
+  max_rounds: 3
+  num_agents: 3
+  num_injections: 0
+  strict_mode: true
+qwen:
+  api_key: 'sk-3e0c2ad56ad540948ceee1a469e05115'
+  base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
+  max_tokens: 2000
+  model: qwen-flash
+  temperature: 0.7
+  top_p: 0.9
