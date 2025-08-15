@@ -5,79 +5,137 @@ from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 import re
 import json
+import os
+import hashlib
 from typing import List, Dict, Any, Optional, Tuple
-
-# 提示词模板
-COT_PROMPT = """
-现在你正在与其他智能体进行辩论讨论。
-请逐步思考并解决这个问题。
-"""
-
-DEBATE_PROMPT = """
-{question}
-
-现在你正在与其他智能体进行辩论讨论。
-请逐步思考并解决这个问题。
-
-请仔细参考以下其他智能体的观点作为额外建议：
-{context}
-"""
-
-PRUNE_PROMPT = """
-问题: {question}
-
-解决方案: {solution}
-
-请分析这个解决方案，指出其中的错误或缺陷（如果存在的话）。
-
-** 你的回答必须以以下格式结束: <label>YES</label> 或 <label>NO</label> 或 <label>NOT SURE</label> **
-- 如果解决方案完全正确，返回YES
-- 如果解决方案的任何部分不正确，返回NO  
-- 如果你不确定，返回NOT SURE
-"""
-
-REFLECT_PROMPT = """
-问题: {question}
-
-错误解决方案: {solutions}
-
-这些是错误的解决方案。请简洁地告诉自己如何避免这些错误。
-"""
-
-REFLECTION_HEAD = """
-考虑以下反思来避免错误的解决方案：
-"""
+from datetime import datetime
+from pathlib import Path
 
 class CoT(BaseModel):
-    """思维链响应格式"""
-    think: str = Field(default="", description="逐步思考过程")
+    hypothesis: str = Field(default="", description="初始假设")
+    forward_reasoning: str = Field(default="", description="前向推理过程")
+    backward_verification: str = Field(default="", description="反向验证过程")
     answer: str = Field(default="", description="最终答案")
+    confidence: float = Field(default=0.5, description="置信度0-1")
 
-class PruneResult(BaseModel):
-    """剪枝结果格式"""
-    analysis: str = Field(default="", description="分析解决方案并指出错误或缺陷")
-    label: str = Field(default="", description="如果解决方案完全正确返回YES，任何部分不正确返回NO，不确定返回NOT SURE")
+class TaskTracker:
+    """任务追踪器"""
+    def __init__(self, base_dir: str = "memory"):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(exist_ok=True)
+        self.task_file = self.base_dir / "tasks.md"
+        self.current_tasks = []
+        
+    def update_tasks(self, question_id: str, status: str, details: str = ""):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        task_entry = f"- [{status}] {question_id}: {details} ({timestamp})\n"
+        
+        with open(self.task_file, "a", encoding="utf-8") as f:
+            f.write(task_entry)
+        
+        self.current_tasks.append({
+            "id": question_id,
+            "status": status,
+            "details": details,
+            "timestamp": timestamp
+        })
+        
+        if len(self.current_tasks) > 10:
+            self.current_tasks = self.current_tasks[-10:]
+    
+    def get_context(self) -> str:
+        if not self.current_tasks:
+            return ""
+        
+        context = "当前任务状态:\n"
+        for task in self.current_tasks[-5:]:
+            context += f"- {task['status']}: {task['details'][:50]}...\n"
+        return context
+
+class MemoryManager:
+    """外部记忆管理器"""
+    def __init__(self, base_dir: str = "memory"):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(exist_ok=True)
+        self.observations_dir = self.base_dir / "observations"
+        self.observations_dir.mkdir(exist_ok=True)
+        self.failures_dir = self.base_dir / "failures"
+        self.failures_dir.mkdir(exist_ok=True)
+        
+    def store_observation(self, content: str, question_id: str) -> str:
+        content_hash = hashlib.md5(content.encode()).hexdigest()[:8]
+        filename = f"{question_id}_{content_hash}.txt"
+        filepath = self.observations_dir / filename
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        
+        return str(filepath)
+    
+    def store_failure(self, error: str, context: Dict[str, Any], question_id: str) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{question_id}_error_{timestamp}.json"
+        filepath = self.failures_dir / filename
+        
+        failure_data = {
+            "error": error,
+            "context": context,
+            "timestamp": timestamp
+        }
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(failure_data, f, ensure_ascii=False, indent=2)
+        
+        return str(filepath)
+    
+    def load_observation(self, filepath: str) -> Optional[str]:
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return f.read()
+        except:
+            return None
+    
+    def compress_context(self, context: List[str], max_length: int = 1000) -> Tuple[str, List[str]]:
+        """可逆上下文压缩"""
+        if not context:
+            return "", []
+        
+        compressed = []
+        references = []
+        
+        for item in context:
+            if len(item) > max_length:
+                ref = self.store_observation(item, f"compress_{hashlib.md5(item.encode()).hexdigest()[:8]}")
+                compressed.append(f"[长内容已存储: {ref}]")
+                references.append(ref)
+            else:
+                compressed.append(item)
+        
+        return "\n".join(compressed), references
 
 def get_field_names(model_class):
-    """获取模型字段名"""
     return model_class.model_fields.keys()
 
 def look_up_description(model_class, field_name):
-    """获取字段描述"""
     return model_class.model_fields[field_name].description
 
-def check_format_and_extract(text: str, format_class: BaseModel) -> Dict[str, str]:
-    """检查XML格式并提取内容"""
+def check_format_and_extract(text: str, format_class: BaseModel) -> Dict[str, Any]:
     pattern = r"<(\w+)>(.*?)</\1>"
     matches = re.findall(pattern, text, re.DOTALL)
     
     found_fields = {match[0]: match[1].strip() for match in matches}
     
+    result = {}
     for field_name in get_field_names(format_class):
-        if field_name not in found_fields or not found_fields[field_name]:
-            raise ValueError(f"Field '{field_name}' is missing or empty.")
+        if field_name == "confidence":
+            try:
+                result[field_name] = float(found_fields.get(field_name, 0.5))
+            except:
+                result[field_name] = 0.5
+        else:
+            result[field_name] = found_fields.get(field_name, "")
     
-    return found_fields
+    return result
 
 def fill_with_xml_suffix(text: str, format_class: BaseModel) -> str:
     field_names = get_field_names(format_class)
@@ -88,238 +146,163 @@ def fill_with_xml_suffix(text: str, format_class: BaseModel) -> str:
         examples.append(f"<{field_name}>{description}</{field_name}>")
     
     example_str = "\n".join(examples)
-    text += f"""
-
-{example_str}
-"""
+    text += f"\n\n{example_str}\n"
     return text
 
-class DebateAgent:
+class BidirectionalDebateAgent:
+    """双向辩论智能体"""
     
-    def __init__(self, name: str, profile: Optional[str] = None, 
-                 enable_prune: bool = True, enable_reflect: bool = True, 
+    def __init__(self, name: str, profile: Optional[str] = None,
+                 enable_prune: bool = True, enable_reflect: bool = True,
                  strict_mode: bool = True, llm_config: Optional[Dict] = None):
-        """
-        初始化辩论智能体
-        
-        Args:
-            name: 智能体名字
-            profile: 智能体人设
-            enable_prune: 是否启用剪枝
-            enable_reflect: 是否启用反思
-            strict_mode: 严格模式
-            llm_config: LLM配置，如果为None则使用全局配置
-        """
         self.name = name
         self.profile = profile
         self.enable_prune = enable_prune
         self.enable_reflect = enable_reflect
         self.strict_mode = strict_mode
         
-        # 内存系统：记录错误答案
-        self.memory: Dict[str, List[str]] = {}
+        self.memory_manager = MemoryManager()
+        self.task_tracker = TaskTracker()
+        self.error_history = []
+        self.reasoning_chain = []
         
-        # 初始化LLM
         if llm_config is None:
             llm_config = get_qwen_config()
         
         self.llm_config = LLMConfig(llm_config)
         self.llm = AsyncQwenLLM(self.llm_config)
-        
-        # 默认响应格式
         self.cot_format = CoT
     
-    async def _get_response(self, prompt: str) -> str:
-        """获取LLM响应"""
-        role_prompt = f"**你是{self.name}**"
-        if self.profile:
-            role_prompt += f"\n你的人设: {self.profile}"
-        
-        full_prompt = role_prompt + '\n\n' + prompt
-        response = await self.llm(full_prompt)
-        return response
-    
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(1), retry=retry_if_exception_type(Exception))
-    async def _get_response_with_format(self, prompt: str, format_class: BaseModel = None) -> Dict[str, str]:
-        """获取格式化的LLM响应"""
+    async def _get_response_with_format(self, prompt: str, format_class: BaseModel = None) -> Dict[str, Any]:
         if format_class is None:
             format_class = self.cot_format
         
         role_prompt = f"**你是{self.name}**"
         if self.profile:
-            role_prompt += f"\n你的人设: {self.profile}"
+            role_prompt += f"\n{self.profile}"
+        
+        task_context = self.task_tracker.get_context()
+        if task_context:
+            role_prompt += f"\n\n{task_context}"
         
         formatted_prompt = role_prompt + '\n\n' + fill_with_xml_suffix(prompt, format_class)
-        response = await self.llm(formatted_prompt)
-        
-        return check_format_and_extract(response, format_class)
-    
-    async def _prune_solutions(self, query: str, solutions: List[str]) -> List[bool]:
-        """剪枝：评估解决方案质量"""
-        if not self.enable_prune or not solutions:
-            return [True] * len(solutions)
-        
-        masks = []
-        for solution in solutions:
-            prompt = PRUNE_PROMPT.format(question=query, solution=solution)
-            
-            try:
-                response = await self._get_response(prompt)
-                label = extract_with_label(response, "label")
-                
-                if label is None:
-                    label_match = re.search(r'<label>(.*?)</label>', response, re.IGNORECASE)
-                    if label_match:
-                        label = label_match.group(1)
-                
-                if label:
-                    normalized_label = normalize_answer(label)
-                    if normalized_label == "yes":
-                        masks.append(True)
-                    elif normalized_label == "no":
-                        masks.append(False)
-                    else:  # "not sure"
-                        masks.append(not self.strict_mode)
-                else:
-                    masks.append(not self.strict_mode)
-                    
-            except Exception as e:
-                print(f"Error in pruning: {e}")
-                masks.append(not self.strict_mode)
-        
-        return masks
-    
-    async def _reflect_on_failures(self, query: str, failed_solutions: List[str]) -> List[str]:
-        """反思失败的解决方案"""
-        if not self.enable_reflect or not failed_solutions:
-            return []
-        
-        failed_answers = []
-        for solution in failed_solutions:
-            answer_match = re.search(r"'answer':\s*'([^']*)'", solution)
-            if answer_match:
-                failed_answers.append(answer_match.group(1))
-            else:
-                lines = solution.split('\n')
-                for line in lines:
-                    if '答案' in line or '结果' in line:
-                        failed_answers.append(line.strip())
-                        break
-        
-        return list(set(failed_answers))  # 去重
-    
-    def _update_memory(self, question_id: str, failed_answers: List[str]):
-        if question_id in self.memory:
-            self.memory[question_id].extend(failed_answers)
-            self.memory[question_id] = list(set(self.memory[question_id]))
-        else:
-            self.memory[question_id] = failed_answers.copy()
-    
-    def _get_memory_context(self, question_id: str) -> str:
-        if question_id in self.memory and self.memory[question_id]:
-            return "之前的错误答案: " + ", ".join(self.memory[question_id])
-        return ""
-    
-    async def generate_response(self, query: str, question_id: str, 
-                              context: Optional[List[str]] = None) -> Tuple[Dict[str, str], Dict[str, Any]]:
-        """
-        生成响应
-        
-        Args:
-            query: 问题
-            question_id: 问题ID
-            context: 其他智能体的解决方案上下文
-            
-        Returns:
-            (response, metadata)
-        """
-        masks = []
-        reflection_summary = ""
-        
-        if context and len(context) > 0:
-            masks = await self._prune_solutions(query, context)
-            
-            if False in masks and self.enable_reflect:
-                failed_solutions = [sol for sol, mask in zip(context, masks) if not mask]
-                failed_answers = await self._reflect_on_failures(query, failed_solutions)
-                
-                if failed_answers:
-                    self._update_memory(question_id, failed_answers)
-                    reflection_summary = f"学习到的错误答案: {', '.join(failed_answers)}"
-            
-            valid_context = [sol for sol, mask in zip(context, masks) if mask]
-            
-            if valid_context:
-                prompt = DEBATE_PROMPT.format(
-                    question=query, 
-                    context='\n'.join([f"观点 {i+1}: {ctx}" for i, ctx in enumerate(valid_context)])
-                )
-            else:
-                prompt = f"{query}\n{COT_PROMPT}"
-            
-            memory_context = self._get_memory_context(question_id)
-            if memory_context:
-                prompt += f"\n\n{memory_context}"
-                
-        else:
-            prompt = f"{query}\n{COT_PROMPT}"
-            
-            memory_context = self._get_memory_context(question_id)
-            if memory_context:
-                prompt += f"\n\n{memory_context}"
         
         try:
-            response = await self._get_response_with_format(prompt)
+            response = await self.llm(formatted_prompt)
+            return check_format_and_extract(response, format_class)
         except Exception as e:
-            print(f"Error generating response for {self.name}: {e}")
-            response = {"think": "生成响应时出现错误", "answer": "无法确定"}
-        
-        metadata = {
-            "masks": masks,
-            "reflection": reflection_summary,
-            "memory_size": len(self.memory.get(question_id, [])),
-            "valid_context_count": len([m for m in masks if m]) if masks else 0
-        }
-        
-        return response, metadata
+            error_ref = self.memory_manager.store_failure(
+                str(e), 
+                {"prompt": prompt[:500]}, 
+                "response_error"
+            )
+            self.error_history.append(error_ref)
+            raise
     
-    async def __call__(self, query: str, question_id: str, 
-                      context: Optional[List[str]] = None) -> Tuple[Dict[str, str], Dict[str, Any]]:
-        """调用智能体进行推理"""
+    async def forward_reasoning(self, query: str, context: Optional[List[str]] = None) -> Dict[str, Any]:
+        """前向推理"""
+        prompt = f"""问题: {query}
+
+请进行前向推理：
+1. 提出初始假设
+2. 逐步推导
+3. 得出初步答案"""
+        
+        if context and len(context) > 0:
+            compressed_context, refs = self.memory_manager.compress_context(context)
+            prompt += f"\n\n参考上下文:\n{compressed_context}"
+        
+        response = await self._get_response_with_format(prompt)
+        self.reasoning_chain.append(("forward", response))
+        return response
+    
+    async def backward_verification(self, query: str, forward_result: Dict[str, Any]) -> Dict[str, Any]:
+        """反向验证"""
+        prompt = f"""问题: {query}
+初步答案: {forward_result.get('answer', '')}
+推理过程: {forward_result.get('forward_reasoning', '')}
+
+请进行反向验证：
+1. 从答案出发，反推是否能得到题目条件
+2. 检查推理链中的每个步骤
+3. 评估答案的可靠性"""
+        
+        response = await self._get_response_with_format(prompt)
+        self.reasoning_chain.append(("backward", response))
+        return response
+    
+    async def synthesize_result(self, forward: Dict[str, Any], backward: Dict[str, Any]) -> Dict[str, Any]:
+        """综合前向和反向结果"""
+        confidence = (forward.get('confidence', 0.5) + backward.get('confidence', 0.5)) / 2
+        
+        if abs(forward.get('confidence', 0.5) - backward.get('confidence', 0.5)) > 0.3:
+            confidence *= 0.8
+        
+        return {
+            "hypothesis": forward.get('hypothesis', ''),
+            "forward_reasoning": forward.get('forward_reasoning', ''),
+            "backward_verification": backward.get('backward_verification', ''),
+            "answer": forward.get('answer', ''),
+            "confidence": confidence
+        }
+    
+    async def generate_response(self, query: str, question_id: str,
+                              context: Optional[List[str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """生成双向推理响应"""
+        self.task_tracker.update_tasks(question_id, "开始", query[:50])
+        
+        try:
+            forward = await self.forward_reasoning(query, context)
+            self.task_tracker.update_tasks(question_id, "前向完成", f"答案: {forward.get('answer', '')[:30]}")
+            
+            backward = await self.backward_verification(query, forward)
+            self.task_tracker.update_tasks(question_id, "反向完成", f"置信度: {backward.get('confidence', 0)}")
+            
+            result = await self.synthesize_result(forward, backward)
+            
+            if len(self.reasoning_chain) > 100:
+                old_chain = self.reasoning_chain[:50]
+                for direction, content in old_chain:
+                    self.memory_manager.store_observation(
+                        json.dumps(content, ensure_ascii=False),
+                        f"chain_{question_id}"
+                    )
+                self.reasoning_chain = self.reasoning_chain[50:]
+            
+            metadata = {
+                "forward_confidence": forward.get('confidence', 0.5),
+                "backward_confidence": backward.get('confidence', 0.5),
+                "final_confidence": result['confidence'],
+                "reasoning_steps": len(self.reasoning_chain),
+                "errors": len(self.error_history)
+            }
+            
+            self.task_tracker.update_tasks(question_id, "完成", f"最终置信度: {result['confidence']:.2f}")
+            
+            return result, metadata
+            
+        except Exception as e:
+            self.task_tracker.update_tasks(question_id, "失败", str(e)[:50])
+            raise
+    
+    async def __call__(self, query: str, question_id: str,
+                      context: Optional[List[str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         return await self.generate_response(query, question_id, context)
     
     def get_usage_summary(self) -> Dict[str, Any]:
-        """获取使用摘要"""
         return self.llm.get_usage_summary()
     
-    def get_memory_summary(self) -> Dict[str, Any]:
-        """获取记忆摘要"""
-        total_memories = sum(len(memories) for memories in self.memory.values())
+    def export_state(self) -> Dict[str, Any]:
         return {
-            "total_questions": len(self.memory),
-            "total_memories": total_memories,
-            "memory_details": {qid: len(memories) for qid, memories in self.memory.items()}
+            "reasoning_chain_length": len(self.reasoning_chain),
+            "error_count": len(self.error_history),
+            "task_history": self.task_tracker.current_tasks
         }
-    
-    def clear_memory(self, question_id: Optional[str] = None):
-        if question_id:
-            if question_id in self.memory:
-                del self.memory[question_id]
-        else:
-            self.memory.clear()
-    
-    def export_memory(self) -> Dict[str, List[str]]:
-        return self.memory.copy()
-    
-    def import_memory(self, memory_data: Dict[str, List[str]]):
-        self.memory.update(memory_data)
 
-def create_agent(name: str, profile: Optional[str] = None, **kwargs) -> DebateAgent:
-    """创建智能体的工厂函数"""
-    return DebateAgent(name=name, profile=profile, **kwargs)
+def create_agent(name: str, profile: Optional[str] = None, **kwargs) -> BidirectionalDebateAgent:
+    return BidirectionalDebateAgent(name=name, profile=profile, **kwargs)
 
-def create_debate_agents(num_agents: int, profiles: Optional[List[str]] = None, **kwargs) -> List[DebateAgent]:
-    """创建多个辩论智能体"""
+def create_debate_agents(num_agents: int, profiles: Optional[List[str]] = None, **kwargs) -> List[BidirectionalDebateAgent]:
     from utils import get_random_unique_names
     
     names = get_random_unique_names(num_agents)
@@ -332,37 +315,3 @@ def create_debate_agents(num_agents: int, profiles: Optional[List[str]] = None, 
         agents.append(agent)
     
     return agents
-
-if __name__ == "__main__":
-    # 测试智能体
-    import asyncio
-    
-    async def test_agent():
-        """测试智能体功能"""
-        print("Testing DebateAgent...")
-        
-        agent = create_agent("测试智能体", "你是一个善于逻辑推理的AI助手")
-        
-        query = "小明有10个苹果，给了小红3个，又给了小华2个，请问小明还剩多少个苹果？"
-        question_id = "test_001"
-        
-        print("第一轮思考:")
-        response1, meta1 = await agent(query, question_id)
-        print(f"思考过程: {response1.get('think', '')}")
-        print(f"答案: {response1.get('answer', '')}")
-        print(f"元数据: {meta1}")
-        
-        wrong_context = [
-            "我认为答案是7个苹果，因为10-3=7",
-            "答案应该是5个苹果，因为10-3-2=5"
-        ]
-        
-        print("\n第二轮辩论:")
-        response2, meta2 = await agent(query, question_id, wrong_context)
-        print(f"思考过程: {response2.get('think', '')}")
-        print(f"答案: {response2.get('answer', '')}")
-        print(f"元数据: {meta2}")
-        
-        print(f"\n使用摘要: {agent.get_usage_summary()}")
-        print(f"记忆摘要: {agent.get_memory_summary()}")
-    

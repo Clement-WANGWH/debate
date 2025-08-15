@@ -1,0 +1,8 @@
+aiohttp
+pydantic
+tenacity
+numpy
+pyyaml
+tqdm
+regex
+sympy

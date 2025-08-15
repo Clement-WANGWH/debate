@@ -8,7 +8,7 @@ debate:
   num_injections: 0
   strict_mode: true
 qwen:
-  api_key: 'sk-3e0c2ad56ad540948ceee1a469e05115'
+  api_key: 'YOUR_API_KEY'
   base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
   max_tokens: 2000
   model: qwen-flash

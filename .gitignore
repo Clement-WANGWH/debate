@@ -9,3 +9,5 @@ cache/
 venv/
 data/
 __pycache__/
+memory/
+key.txt
